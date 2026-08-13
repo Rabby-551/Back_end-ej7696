@@ -246,7 +246,7 @@ export const recordMyRevenueCatRefundRequest = catchAsync(async (req, res) => {
     statusCode: httpStatus.OK,
     success: true,
     message: result.accepted
-      ? "Subscription changed to Starter"
+      ? "Purchase-linked exam access was revoked"
       : "No subscription change was required",
     data: {
       accepted: result.accepted,

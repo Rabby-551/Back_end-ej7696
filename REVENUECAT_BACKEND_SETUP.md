@@ -42,16 +42,32 @@ For stronger validation, enable HMAC webhook signing in RevenueCat and set
 `REVENUECAT_WEBHOOK_SIGNING_SECRET`. The server verifies the signature against
 the original raw JSON bytes and rejects signatures older than five minutes.
 
+## Six-month exam products
+
+Create one non-renewing/prepaid six-month product per exam using the identifiers
+listed in `.env.example`. The current Google/Apple USD store tier is $149.99
+(the closest available tier to the $150 business price). The initial
+`six_month_subscriptions` product is USD 199.99 and must be purchased only after
+the user selects an exam. Keep the legacy `.unlock` products attached to
+RevenueCat for restore/migration reads, but remove them from current offerings.
+Set `EXAM_SUBSCRIPTION_MIGRATION_AT` once to the production migration timestamp
+and never change it, so later legacy restores receive the same fixed six-month
+window instead of extending access on every restore.
+
+Place products in separate subscription groups/base-plan-compatible groups so a
+customer can hold multiple exam entitlements concurrently. Use manual renewal;
+do not configure an automatic renewal offer.
+
 ## Lifecycle behavior
 
 - Initial purchases, renewals, uncancellations, extensions, transfers, and
   temporary grants synchronize current RevenueCat access.
-- A subscription cancellation immediately changes the backend plan to Starter,
-  even when RevenueCat still reports paid entitlement time.
-- A successful Customer Center subscription-refund submission also changes the
-  backend plan to Starter immediately. Failed or abandoned submissions do not
-  change the plan, and one-time exam purchases are not changed by this callback.
-- Expiration or a confirmed store refund removes RevenueCat-backed access.
+- Cancellation does not change the account back to Starter. Each exam stays
+  active until its own `expiresAt`, then only that exam locks.
+- A successful Customer Center refund submission revokes only the exam linked
+  to that purchase. Failed or abandoned submissions do not change access.
+- Expiration locks only the matching exam. A confirmed refund revokes only the
+  exam attached to that transaction.
 - Webhook event IDs are stored uniquely, so retries cannot apply the same event
   twice.
 - Unknown future event types are recorded and acknowledged without changing
@@ -118,17 +134,19 @@ The existing admin refund endpoint remains:
   refund and revoke access.
 - Manual records: local refund bookkeeping is supported.
 
-Partial plan refunds no longer downgrade the user. A full plan refund downgrades
-the user, locks RevenueCat/plan exam access, voids linked add-ons, and rebuilds
-resource access from the user's remaining completed purchases.
+Neither partial nor full refunds downgrade the account to Starter. A full
+refund revokes only the exam linked to that transaction, voids linked add-ons,
+and rebuilds resource access from the user's remaining completed purchases.
 
 ## Deployment order
 
-1. Deploy the backend and install production dependencies.
-2. Confirm `GET https://api.inspectorspath.com/` returns HTTP 200.
-3. Configure the webhook in RevenueCat using the values above.
-4. Send a RevenueCat test webhook and confirm HTTP 200.
-5. Make a sandbox purchase and confirm the user's backend profile becomes
+1. Set the fixed `EXAM_SUBSCRIPTION_MIGRATION_AT` timestamp and run
+   `npm run migrate:exam-subscriptions` once before releasing the new app.
+2. Deploy the compatible backend and install production dependencies.
+3. Confirm `GET https://api.inspectorspath.com/` returns HTTP 200.
+4. Configure the webhook and products in RevenueCat using the values above.
+5. Send a RevenueCat test webhook and confirm HTTP 200.
+6. Make a sandbox purchase and confirm the user's backend profile becomes
    `professional` with a RevenueCat expiration date.
-6. Test unsubscribe (access remains through expiry), expiration, refund, restore,
+7. Test unsubscribe (access remains through expiry), expiration, refund, restore,
    duplicate webhook delivery, and account transfer.

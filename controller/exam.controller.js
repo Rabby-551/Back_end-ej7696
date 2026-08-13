@@ -14,9 +14,10 @@ import { ExamRating } from "../model/examRating.model.js";
 import { User } from "../model/user.model.js";
 import {
   canAccessOwnedExam,
-  isActiveProfessionalSubscription,
+  isExamEntitlementActive,
   isExamOwned,
 } from "../utils/examAccess.helpers.js";
+import { expireExamEntitlements } from "../utils/examSubscription.service.js";
 import {
   approveQuestionBankReviewBatches,
   QUESTION_BANK_DEFAULT_BATCH_SIZE,
@@ -385,10 +386,7 @@ export const getActiveExams = catchAsync(async (req, res) => {
   if (req.user?._id) {
     const userId = req.user._id.toString();
     const now = new Date();
-    const hasActiveSubscription = isActiveProfessionalSubscription(
-      req.user,
-      now
-    );
+    await expireExamEntitlements({ userId, now });
     const examIds = data.exams.map((exam) => exam._id);
 
     const accesses = await ExamAccess.find({
@@ -405,19 +403,26 @@ export const getActiveExams = catchAsync(async (req, res) => {
     data.exams = data.exams.map((exam) => {
       const access = accessMap[exam._id.toString()];
       const owned = isExamOwned(access);
-      const isUnlocked = canAccessOwnedExam({
-        user: req.user,
-        access,
-        referenceDate: now,
-      });
+      const isUnlocked = canAccessOwnedExam({ access, referenceDate: now });
+      const expiresAt = access?.expiresAt || null;
+      const isExpired = Boolean(
+        expiresAt && new Date(expiresAt).getTime() <= now.getTime()
+      );
       return {
         ...exam,
         unlockPrice,
         currency,
         unlocked: Boolean(isUnlocked),
         owned,
-        requiresSubscription: owned && !hasActiveSubscription,
+        requiresSubscription: false,
         accessStatus: isUnlocked ? "unlocked" : "locked",
+        entitlementStatus: isUnlocked ? "active" : isExpired ? "expired" : "locked",
+        startedAt: access?.startedAt || access?.purchasedAt || null,
+        expiresAt,
+        isExpired,
+        canPurchase: !isUnlocked,
+        durationMonths: 6,
+        currentPrice: unlockPrice,
         ownershipStatus: access?.status || "free",
         purchaseType: access?.purchaseType || null,
         paymentStatus: access?.paymentStatus || null,
@@ -432,6 +437,13 @@ export const getActiveExams = catchAsync(async (req, res) => {
       owned: false,
       requiresSubscription: false,
       accessStatus: "locked",
+      entitlementStatus: "locked",
+      startedAt: null,
+      expiresAt: null,
+      isExpired: false,
+      canPurchase: true,
+      durationMonths: 6,
+      currentPrice: unlockPrice,
       ownershipStatus: "free",
       purchaseType: null,
       paymentStatus: null,
@@ -508,18 +520,19 @@ export const startExam = catchAsync(async (req, res) => {
   );
 
   const now = new Date();
+  await expireExamEntitlements({ userId, now });
   const monthKey = getMonthKey(now);
   const accessDoc = await ExamAccess.findOne({ userId, examId });
-  const isProfessionalUser = isActiveProfessionalSubscription(req.user, now);
+  const isProfessionalUser = isExamEntitlementActive(accessDoc, now);
   const ownsExam = isExamOwned(accessDoc);
   const isUnlocked = ownsExam && isProfessionalUser;
   const subscriptionStartedAt =
-    isProfessionalUser && req.user?.subscriptionStartedAt
-      ? new Date(req.user.subscriptionStartedAt)
+    isProfessionalUser && (accessDoc?.startedAt || accessDoc?.purchasedAt)
+      ? new Date(accessDoc.startedAt || accessDoc.purchasedAt)
       : null;
   const subscriptionExpiresAt =
-    isProfessionalUser && req.user?.subscriptionExpiresAt
-      ? new Date(req.user.subscriptionExpiresAt)
+    isProfessionalUser && accessDoc?.expiresAt
+      ? new Date(accessDoc.expiresAt)
       : null;
   const isStarterUser = !isProfessionalUser;
 

@@ -21,12 +21,12 @@ import {
 } from "../utils/resource.service.js";
 import {
   buildExamUnlockSummary,
-  isActiveProfessionalSubscription,
 } from "../utils/examAccess.helpers.js";
+import { expireExamEntitlements } from "../utils/examSubscription.service.js";
 
 const safeUserSelect =
   "-password -refreshToken -verificationInfo -password_reset_token";
-const PROFESSIONAL_SUBSCRIPTION_MONTHS = 3;
+const PROFESSIONAL_SUBSCRIPTION_MONTHS = 6;
 const SESSION_CLEAR_UPDATE = {
   refreshToken: "",
   activeSessionId: "",
@@ -333,9 +333,11 @@ export const getMyUnlocks = catchAsync(async (req, res) => {
     throw new AppError(httpStatus.NOT_FOUND, "User not found");
   }
 
+  await expireExamEntitlements({ userId: user._id });
+
   const accesses = await ExamAccess.find({
     userId: user._id,
-    status: "unlocked",
+    status: { $in: ["active", "expired", "revoked", "unlocked"] },
   }).lean();
 
   const examIds = [
@@ -353,17 +355,15 @@ export const getMyUnlocks = catchAsync(async (req, res) => {
     return acc;
   }, {});
 
-  const hasActiveSubscription = isActiveProfessionalSubscription(user);
   const ownedExams = accesses.map((access) =>
     buildExamUnlockSummary({
       access,
       examMap,
       examImageMap,
       user,
-      unlocked: hasActiveSubscription,
     })
   );
-  const unlockedExams = hasActiveSubscription ? ownedExams : [];
+  const unlockedExams = ownedExams.filter((exam) => exam.unlocked);
 
   const resourceAccess = await buildUnlockedResources(user);
 
@@ -410,7 +410,7 @@ export const getUsers = catchAsync(async (req, res) => {
   const accesses = userIds.length
     ? await ExamAccess.find({
         userId: { $in: userIds },
-        status: "unlocked",
+        status: { $in: ["active", "unlocked"] },
       }).lean()
     : [];
 
@@ -546,7 +546,7 @@ export const getUserDetails = catchAsync(async (req, res) => {
 
   const accesses = await ExamAccess.find({
     userId: user._id,
-    status: "unlocked",
+    status: { $in: ["active", "unlocked"] },
   }).lean();
 
   const examIds = [
@@ -784,7 +784,10 @@ export const getRefundedUsers = catchAsync(async (req, res) => {
 
   const userIds = users.map((u) => u._id);
   const accesses = userIds.length
-    ? await ExamAccess.find({ userId: { $in: userIds }, status: "unlocked" }).lean()
+    ? await ExamAccess.find({
+        userId: { $in: userIds },
+        status: { $in: ["active", "expired", "revoked", "unlocked"] },
+      }).lean()
     : [];
 
   const examIds = [

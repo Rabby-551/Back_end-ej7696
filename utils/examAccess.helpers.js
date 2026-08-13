@@ -27,14 +27,26 @@ export const isActiveProfessionalSubscription = (
 // ExamAccess.status records durable ownership. Actual access is deliberately
 // gated by the user's subscription so owned exams become available again after
 // a later resubscription without charging for the exam a second time.
-export const isExamOwned = (access) => access?.status === "unlocked";
+export const isExamOwned = (access) =>
+  ["active", "expired", "revoked", "unlocked"].includes(access?.status);
+
+export const isExamEntitlementActive = (
+  access,
+  referenceDate = new Date()
+) => {
+  if (!access || !["active", "unlocked"].includes(access.status)) return false;
+  const expiresAt = access.expiresAt ? new Date(access.expiresAt) : null;
+  return Boolean(
+    expiresAt &&
+      !Number.isNaN(expiresAt.getTime()) &&
+      expiresAt.getTime() > new Date(referenceDate).getTime()
+  );
+};
 
 export const canAccessOwnedExam = ({
-  user,
   access,
   referenceDate = new Date(),
-} = {}) =>
-  isExamOwned(access) && isActiveProfessionalSubscription(user, referenceDate);
+} = {}) => isExamEntitlementActive(access, referenceDate);
 
 export const buildSelectedExamUnlockResponse = ({ exam, access } = {}) => {
   if (!exam || !access) return null;
@@ -42,11 +54,12 @@ export const buildSelectedExamUnlockResponse = ({ exam, access } = {}) => {
   return {
     examId: exam._id,
     examName: exam.name || null,
-    unlocked: isExamOwned(access),
+    unlocked: isExamEntitlementActive(access),
     accessId: access._id,
     purchaseType: access.purchaseType,
     paymentStatus: access.paymentStatus,
     accessDuration: access.accessDuration,
+    startedAt: access.startedAt || access.purchasedAt,
     expiresAt: access.expiresAt,
   };
 };
@@ -58,23 +71,17 @@ export const buildExamUnlockSummary = ({
   user,
   expiryMonths = 3,
   now = Date.now(),
-  unlocked = isActiveProfessionalSubscription(user, new Date(now)),
+  unlocked = isExamEntitlementActive(access, new Date(now)),
 }) => {
-  const owned = isExamOwned(access);
+  const owned = ["active", "expired", "revoked", "unlocked"].includes(
+    access?.status
+  );
   const hasAccess = owned && Boolean(unlocked);
-  const unlockDate = access?.purchasedAt || null;
-  const isLifetime =
-    access?.accessDuration === "lifetime" || access?.purchaseType !== "plan";
-  const fallbackExpiresAt = unlockDate
-    ? addMonths(unlockDate, expiryMonths)
-    : null;
-  const expiresAt = isLifetime
-    ? null
-    : access?.expiresAt ||
-      (access?.purchaseType === "plan"
-        ? user?.subscriptionExpiresAt || fallbackExpiresAt
-        : fallbackExpiresAt);
-  const isExpired = !isLifetime && expiresAt
+  const unlockDate = access?.startedAt || access?.purchasedAt || null;
+  const isLifetime = false;
+  const fallbackExpiresAt = unlockDate ? addMonths(unlockDate, 6) : null;
+  const expiresAt = access?.expiresAt || fallbackExpiresAt;
+  const isExpired = expiresAt
     ? new Date(expiresAt).getTime() <= now
     : false;
 
@@ -87,12 +94,17 @@ export const buildExamUnlockSummary = ({
     unlockDate,
     purchasedAt: unlockDate,
     expiresAt,
-    expiryMonths: isLifetime ? null : expiryMonths,
-    accessDuration: access?.accessDuration || "three_months",
+    startedAt: unlockDate,
+    expiryMonths: 6,
+    accessDuration: access?.accessDuration || "six_months",
+    accessStatus: hasAccess ? "active" : isExpired ? "expired" : access?.status,
+    source: access?.source || "legacy",
+    canPurchase: !hasAccess,
+    currentPrice: 150,
     isLifetime,
     isExpired,
     owned,
     unlocked: hasAccess,
-    requiresSubscription: owned && !hasAccess,
+    requiresSubscription: false,
   };
 };

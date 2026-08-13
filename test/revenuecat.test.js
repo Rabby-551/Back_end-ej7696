@@ -20,6 +20,39 @@ import {
   canAccessOwnedExam,
   isActiveProfessionalSubscription,
 } from "../utils/examAccess.helpers.js";
+import {
+  addExamAccessMonths,
+  buildLegacyExamEntitlementWindow,
+} from "../utils/examSubscription.service.js";
+
+test("six-month access uses calendar months", () => {
+  assert.equal(
+    addExamAccessMonths(new Date("2026-08-13T00:00:00.000Z")).toISOString(),
+    "2027-02-13T00:00:00.000Z"
+  );
+  assert.equal(
+    addExamAccessMonths(new Date("2026-08-31T00:00:00.000Z")).toISOString(),
+    "2027-02-28T00:00:00.000Z"
+  );
+});
+
+test("legacy restore uses the fixed migration anchor", () => {
+  const previousValue = process.env.EXAM_SUBSCRIPTION_MIGRATION_AT;
+  process.env.EXAM_SUBSCRIPTION_MIGRATION_AT = "2026-08-13T00:00:00.000Z";
+  try {
+    const window = buildLegacyExamEntitlementWindow(
+      new Date("2024-01-01T00:00:00.000Z")
+    );
+    assert.equal(window.startedAt.toISOString(), "2026-08-13T00:00:00.000Z");
+    assert.equal(window.expiresAt.toISOString(), "2027-02-13T00:00:00.000Z");
+  } finally {
+    if (previousValue === undefined) {
+      delete process.env.EXAM_SUBSCRIPTION_MIGRATION_AT;
+    } else {
+      process.env.EXAM_SUBSCRIPTION_MIGRATION_AT = previousValue;
+    }
+  }
+});
 
 test("RevenueCat webhook authorization accepts raw and Bearer token formats", () => {
   assert.equal(isValidRevenueCatAuthorization("secret", "secret"), true);
@@ -111,32 +144,36 @@ test("RevenueCat v2 product identifiers are parsed defensively", () => {
   );
 });
 
-test("RevenueCat lifetime exam access never receives a fallback expiry", () => {
+test("exam access is summarized as a six-month entitlement", () => {
   const purchasedAt = new Date("2025-01-01T00:00:00.000Z");
+  const expiresAt = new Date("2025-07-01T00:00:00.000Z");
   const result = buildExamUnlockSummary({
     access: {
       examId: "exam-570",
+      status: "active",
       purchaseType: "exam",
       paymentStatus: "completed",
-      accessDuration: "lifetime",
+      accessDuration: "six_months",
       purchasedAt,
+      expiresAt,
     },
     examMap: { "exam-570": "API 570" },
     examImageMap: {
       "exam-570": "https://cdn.example.com/exams/api-570.png",
     },
     user: null,
-    now: new Date("2035-01-01T00:00:00.000Z").getTime(),
+    now: new Date("2025-02-01T00:00:00.000Z").getTime(),
   });
 
-  assert.equal(result.isLifetime, true);
+  assert.equal(result.isLifetime, false);
   assert.equal(
     result.examImageUrl,
     "https://cdn.example.com/exams/api-570.png"
   );
-  assert.equal(result.expiresAt, null);
-  assert.equal(result.expiryMonths, null);
+  assert.equal(result.expiresAt, expiresAt);
+  assert.equal(result.expiryMonths, 6);
   assert.equal(result.isExpired, false);
+  assert.equal(result.unlocked, true);
 });
 
 test("selected exam sync response explicitly confirms the unlocked exam", () => {
@@ -145,7 +182,7 @@ test("selected exam sync response explicitly confirms the unlocked exam", () => 
     access: {
       _id: "access-1",
       examId: "exam-570",
-      status: "unlocked",
+      status: "active",
       purchaseType: "plan",
       paymentStatus: "completed",
       accessDuration: "subscription",
@@ -160,8 +197,7 @@ test("selected exam sync response explicitly confirms the unlocked exam", () => 
   assert.equal(result.paymentStatus, "completed");
 });
 
-test("exam ownership is accessible only with an active Professional subscription", () => {
-  const access = { status: "unlocked", purchaseType: "exam" };
+test("exam access depends on its own expiry, not the account plan expiry", () => {
   const activeUser = {
     subscriptionTier: "professional",
     subscriptionExpiresAt: "2030-01-01T00:00:00.000Z",
@@ -171,15 +207,20 @@ test("exam ownership is accessible only with an active Professional subscription
     subscriptionExpiresAt: null,
   };
   const now = new Date("2029-01-01T00:00:00.000Z");
+  const activeAccess = {
+    status: "active",
+    purchaseType: "exam",
+    expiresAt: "2030-01-01T00:00:00.000Z",
+  };
 
   assert.equal(isActiveProfessionalSubscription(activeUser, now), true);
   assert.equal(
-    canAccessOwnedExam({ user: activeUser, access, referenceDate: now }),
+    canAccessOwnedExam({ user: activeUser, access: activeAccess, referenceDate: now }),
     true
   );
   assert.equal(
-    canAccessOwnedExam({ user: starterUser, access, referenceDate: now }),
-    false
+    canAccessOwnedExam({ user: starterUser, access: activeAccess, referenceDate: now }),
+    true
   );
   assert.equal(
     canAccessOwnedExam({
@@ -191,11 +232,11 @@ test("exam ownership is accessible only with an active Professional subscription
   );
 });
 
-test("legacy standalone exam purchases are summarized as durable ownership", () => {
+test("expired legacy exam remains owned but can be renewed", () => {
   const result = buildExamUnlockSummary({
     access: {
       examId: "exam-1184",
-      status: "unlocked",
+      status: "expired",
       purchaseType: "exam",
       paymentStatus: "completed",
       accessDuration: "three_months",
@@ -210,10 +251,11 @@ test("legacy standalone exam purchases are summarized as durable ownership", () 
 
   assert.equal(result.owned, true);
   assert.equal(result.unlocked, false);
-  assert.equal(result.requiresSubscription, true);
-  assert.equal(result.isLifetime, true);
-  assert.equal(result.isExpired, false);
-  assert.equal(result.expiresAt, null);
+  assert.equal(result.requiresSubscription, false);
+  assert.equal(result.isLifetime, false);
+  assert.equal(result.isExpired, true);
+  assert.equal(result.expiresAt.toISOString(), "2025-04-01T00:00:00.000Z");
+  assert.equal(result.canPurchase, true);
 });
 
 test("only a successful Customer Center refund submission changes access", () => {

@@ -9,6 +9,7 @@ import { AppSetting } from "../model/appSetting.model.js";
 import { ResourceProduct } from "../model/resourceProduct.model.js";
 import { ResourcePurchase } from "../model/resourcePurchase.model.js";
 import { ProfessionalPlanPurchase } from "../model/professionalPlanPurchase.model.js";
+import { ExamSubscriptionTransaction } from "../model/examSubscriptionTransaction.model.js";
 import { ReferralRelationship } from "../model/referralRelationship.model.js";
 import Stripe from "stripe";
 import mongoose from "mongoose";
@@ -31,6 +32,15 @@ import {
   voidReferralRewardsForPlanPurchase,
 } from "../utils/referral.service.js";
 import { refundRevenueCatTransaction } from "../utils/revenuecat.service.js";
+import {
+  addExamAccessMonths,
+  buildLegacyExamEntitlementWindow,
+  grantExamEntitlement,
+  markExamSubscriptionTransactionStatus,
+  recordPendingExamSubscription,
+  revokeExamEntitlement,
+} from "../utils/examSubscription.service.js";
+import { isExamEntitlementActive } from "../utils/examAccess.helpers.js";
 
 const PAYPAL_BASE_URL =
   process.env.PAYPAL_BASE_URL || "https://api-m.sandbox.paypal.com";
@@ -38,13 +48,24 @@ const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "";
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "";
 const DEFAULT_EXAM_PRICE = Number(process.env.EXAM_PRICE_PER_EXAM) || 150;
 const DEFAULT_PRO_PLAN_PRICE =
-  Number(process.env.PROFESSIONAL_PLAN_PRICE) || 180;
+  Number(process.env.PROFESSIONAL_PLAN_PRICE) || 199.99;
 const DEFAULT_CURRENCY = process.env.EXAM_PRICE_CURRENCY || "USD";
-const DEFAULT_PRO_PLAN_INTERVAL_COUNT = 3;
+const DEFAULT_PRO_PLAN_INTERVAL_COUNT = 6;
 const DEFAULT_PRO_PLAN_INTERVAL_UNIT = "months";
 const DEFAULT_PRO_PLAN_DESCRIPTION = "What's included in your plan";
 const APPLE_PROFESSIONAL_PRODUCT_ID = "six_month_subscriptions";
 const EXAM_IAP_PRODUCT_IDS = {
+  API_1184: "com.inspectorspath.exam.api1184.sixmonth",
+  API_510: "com.inspectorspath.exam.api510.sixmonth",
+  API_570: "com.inspectorspath.exam.api570.sixmonth",
+  API_653: "com.inspectorspath.exam.api653.sixmonth",
+  API_936: "com.inspectorspath.exam.api936.sixmonth",
+  API_1169: "com.inspectorspath.exam.api1169.sixmonth",
+  API_SIEE: "com.inspectorspath.exam.siee.sixmonth",
+  API_SIFE: "com.inspectorspath.exam.sife.sixmonth",
+  API_SIRE: "com.inspectorspath.exam.sire.sixmonth",
+};
+const LEGACY_EXAM_IAP_PRODUCT_IDS = {
   API_1184: "com.inspectorspath.exam.api1184.unlock",
   API_510: "com.inspectorspath.exam.api510.unlock",
   API_570: "com.inspectorspath.exam.api570.unlock",
@@ -60,7 +81,7 @@ const APPLE_VERIFY_PRODUCTION_URL =
 const APPLE_VERIFY_SANDBOX_URL =
   "https://sandbox.itunes.apple.com/verifyReceipt";
 const DEFAULT_PRO_PLAN_FEATURES = [
-  "Access to selected free exams",
+  "One selected exam included for 6 months",
   "Full-length mock exams",
   "Timed & full simulation modes",
   "Interactive study mode",
@@ -451,10 +472,19 @@ const hasCompletedExamUnlockPurchase = async (userId) => {
   const hit = await ExamAccess.exists({
     userId,
     purchaseType: "exam",
-    status: "unlocked",
+    status: { $in: ["active", "unlocked"] },
     paymentStatus: "completed",
   });
   return Boolean(hit);
+};
+
+const assertCanPurchaseAdditionalExam = (user) => {
+  if (user?.subscriptionTier !== "professional") {
+    throw new AppError(
+      httpStatus.FORBIDDEN,
+      "Complete the initial $199.99 subscription and select an included exam first"
+    );
+  }
 };
 
 const upsertExamAccessSafely = async (filter, update, options = {}) => {
@@ -495,6 +525,15 @@ const resolveExamAppleProductId = (exam) => {
     normalizeExamIapCode(exam?.slug) ||
     normalizeExamIapCode(exam?.name);
   return code ? EXAM_IAP_PRODUCT_IDS[code] : "";
+};
+
+const resolveLegacyExamAppleProductId = (exam) => {
+  const code =
+    normalizeExamIapCode(exam?.code) ||
+    normalizeExamIapCode(exam?.examCode) ||
+    normalizeExamIapCode(exam?.slug) ||
+    normalizeExamIapCode(exam?.name);
+  return code ? LEGACY_EXAM_IAP_PRODUCT_IDS[code] : "";
 };
 
 const appleReceiptPassword = () =>
@@ -1106,16 +1145,6 @@ const getProfessionalPlanIntervalSettings = async () => {
   };
 };
 
-const hasActiveProfessionalSubscription = (user, referenceDate = new Date()) => {
-  if (!user) return false;
-  if (user.subscriptionTier?.toString().toLowerCase() !== "professional") {
-    return false;
-  }
-  if (!user.subscriptionExpiresAt) return false;
-  const expiresAt = new Date(user.subscriptionExpiresAt);
-  return expiresAt.getTime() > referenceDate.getTime();
-};
-
 const buildProfessionalSubscriptionWindow = async (startDate = new Date()) => {
   const { count, unit } = await getProfessionalPlanIntervalSettings();
   const subscriptionStartedAt = new Date(startDate);
@@ -1244,24 +1273,6 @@ const shouldRevokeCurrentSubscription = (user, provider) => {
   return !currentProvider || currentProvider === provider;
 };
 
-const planAccessRefundFilter = (transaction, provider) => {
-  const filter = {
-    userId: transaction.userId,
-    status: "unlocked",
-    purchaseType: "plan",
-  };
-  if (provider === "stripe" && transaction.stripePaymentIntentId) {
-    filter.stripePaymentIntentId = transaction.stripePaymentIntentId;
-  } else if (provider === "paypal" && transaction.paypalOrderId) {
-    filter.paypalOrderId = transaction.paypalOrderId;
-  } else if (provider === "revenuecat") {
-    filter["metadata.provider"] = "revenuecat";
-  } else if (transaction.examId) {
-    filter.examId = transaction.examId;
-  }
-  return filter;
-};
-
 export const createExamStripePaymentIntent = catchAsync(async (req, res) => {
   const userId = req.user?._id;
   const examId = req.params.examId;
@@ -1275,15 +1286,11 @@ export const createExamStripePaymentIntent = catchAsync(async (req, res) => {
   ]);
   if (!user) throw new AppError(httpStatus.NOT_FOUND, "User not found");
   if (!exam) throw new AppError(httpStatus.NOT_FOUND, "Exam not found");
+  assertCanPurchaseAdditionalExam(user);
 
   const existingAccess = await ExamAccess.findOne({ userId, examId });
-  if (existingAccess?.status === "unlocked") {
-    return sendResponse(res, {
-      statusCode: httpStatus.OK,
-      success: true,
-      message: "Exam already unlocked",
-      data: { unlocked: true },
-    });
+  if (isExamEntitlementActive(existingAccess)) {
+    throw new AppError(httpStatus.CONFLICT, "Exam subscription is already active");
   }
 
   const {
@@ -1361,6 +1368,15 @@ export const createExamStripePaymentIntent = catchAsync(async (req, res) => {
     },
     { new: true }
   );
+  await recordPendingExamSubscription({
+    userId,
+    examId,
+    examAccessId: accessDoc._id,
+    provider: "stripe",
+    externalTransactionId: paymentIntent.id,
+    amount: totalAmount,
+    currency: pricing.currency,
+  });
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
@@ -1403,7 +1419,7 @@ export const confirmExamStripePayment = catchAsync(async (req, res) => {
   }
 
   const accessDoc = await ExamAccess.findOne({ userId, examId });
-  if (accessDoc?.status === "unlocked") {
+  if (isExamEntitlementActive(accessDoc)) {
     return sendResponse(res, {
       statusCode: httpStatus.OK,
       success: true,
@@ -1430,28 +1446,32 @@ export const confirmExamStripePayment = catchAsync(async (req, res) => {
       status: "failed",
       reason: "Stripe payment not completed",
     });
+    await markExamSubscriptionTransactionStatus({
+      provider: "stripe",
+      externalTransactionId: paymentIntentId,
+      status: "failed",
+      reason: "Stripe payment not completed",
+    });
     throw new AppError(httpStatus.BAD_GATEWAY, "Stripe payment not completed");
   }
 
   const paymentFingerprint = buildStripePaymentAccountFingerprint(paymentIntent);
 
-  const updatedAccess = await ExamAccess.findOneAndUpdate(
-    { userId, examId },
-    {
-      userId,
-      examId,
-      status: "unlocked",
-      paymentStatus: "completed",
+  const startedAt = new Date();
+  const { access: updatedAccess } = await grantExamEntitlement({
+    userId,
+    examId,
+    source: "exam_subscription",
+    provider: "stripe",
+    amount: accessDoc?.purchasePrice || accessDoc?.totalAmount || DEFAULT_EXAM_PRICE,
+    currency: accessDoc?.currency || DEFAULT_CURRENCY,
+    startedAt,
+    externalTransactionId: paymentIntentId,
+    paymentFields: {
       stripePaymentIntentId: paymentIntentId,
-      purchaseType: "exam",
-      accessDuration: "lifetime",
-      expiresAt: null,
-      maxQuestionsPerSession: 30,
       paymentAccountFingerprint: paymentFingerprint,
-      purchasedAt: new Date(),
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
+  });
 
   let addonPurchase = null;
   let addonPurchases = [];
@@ -1482,6 +1502,9 @@ export const confirmExamStripePayment = catchAsync(async (req, res) => {
       transactionReference: buildStripeTransactionReference(paymentIntent),
       paidAt: updatedAccess.purchasedAt,
       provider: "stripe",
+      startedAt: updatedAccess.startedAt,
+      expiresAt: updatedAccess.expiresAt,
+      durationMonths: 6,
       access: updatedAccess,
       addonPurchase,
       addonPurchases,
@@ -1504,10 +1527,10 @@ export const createProfessionalPlanStripePaymentIntent = catchAsync(
 
     const user = await User.findById(userId);
     if (!user) throw new AppError(httpStatus.NOT_FOUND, "User not found");
-    if (hasActiveProfessionalSubscription(user)) {
+    if (await hasCompletedProfessionalPurchase(userId)) {
       throw new AppError(
         httpStatus.BAD_REQUEST,
-        "User already has professional plan"
+        "Initial subscription has already been purchased"
       );
     }
 
@@ -1569,6 +1592,7 @@ export const createProfessionalPlanStripePaymentIntent = catchAsync(
         amount: planPurchase.totalAmount,
         currency: stripeCurrency,
         examId,
+        pendingSelectionReference: planPurchase._id,
         breakdown: {
           planBasePrice: planPurchase.planBasePrice,
           subtotalBeforeReferral:
@@ -1655,23 +1679,26 @@ export const confirmProfessionalPlanStripePayment = catchAsync(
       throw new AppError(httpStatus.BAD_REQUEST, "Payment intent missing examId");
     }
 
-    const updatedAccess = await upsertExamAccessSafely(
-      { userId, examId },
-      {
-        userId,
-        examId,
-        status: "unlocked",
-        paymentStatus: "completed",
-        stripePaymentIntentId: paymentIntentId,
-        purchaseType: "plan",
-        purchasePrice: planPurchase.planFinalPrice,
-        maxQuestionsPerSession: 30,
-        purchasedAt: new Date(),
-      }
-    );
-
     const { subscriptionStartedAt, subscriptionExpiresAt, intervalLabel } =
       await buildProfessionalSubscriptionWindow();
+
+    const { access: updatedAccess } = await grantExamEntitlement({
+      userId,
+      examId,
+      source: "initial_included",
+      provider: "stripe",
+      amount: 0,
+      currency: planPurchase.currency || DEFAULT_CURRENCY,
+      startedAt: subscriptionStartedAt,
+      expiresAt: subscriptionExpiresAt,
+      externalTransactionId: paymentIntentId,
+      purchaseType: "plan",
+      paymentFields: { stripePaymentIntentId: paymentIntentId },
+      metadata: {
+        includedWithInitialPrice: planPurchase.planFinalPrice,
+        planPurchaseId: planPurchase._id,
+      },
+    });
 
     await User.findByIdAndUpdate(userId, {
       subscriptionTier: "professional",
@@ -1777,18 +1804,25 @@ export const verifyAppleExamPurchase = catchAsync(async (req, res) => {
   if (!exam) throw new AppError(httpStatus.NOT_FOUND, "Exam not found");
 
   const expectedProductId = resolveExamAppleProductId(exam);
+  const legacyProductId = resolveLegacyExamAppleProductId(exam);
   const payload = appleVerificationPayload(req.body);
   if (!expectedProductId) {
     throw new AppError(httpStatus.BAD_REQUEST, "Apple product is not configured for this exam");
   }
-  if (payload.productId !== expectedProductId) {
+  if (
+    payload.productId !== expectedProductId &&
+    payload.productId !== legacyProductId
+  ) {
     throw new AppError(httpStatus.BAD_REQUEST, "Apple product does not match exam");
+  }
+  if (payload.productId !== legacyProductId) {
+    assertCanPurchaseAdditionalExam(user);
   }
 
   const verification = await verifyAppleReceipt(payload.receiptData);
   const transaction = findAppleTransaction({
     verification,
-    productId: expectedProductId,
+    productId: payload.productId,
     transactionId: payload.transactionId,
   });
   assertAppleTransactionActive(transaction);
@@ -1807,39 +1841,44 @@ export const verifyAppleExamPurchase = catchAsync(async (req, res) => {
   }
 
   const pricing = await getPricing();
-  const updatedAccess = await upsertExamAccessSafely(
-    { userId, examId },
-    {
-      userId,
-      examId,
-      status: "unlocked",
-      paymentStatus: "completed",
-      purchaseType: "exam",
-      accessDuration: "lifetime",
-      expiresAt: null,
-      currency: pricing.currency || DEFAULT_CURRENCY,
-      basePrice: pricing.examUnlockPrice ?? DEFAULT_EXAM_PRICE,
-      purchasePrice: pricing.examUnlockPrice ?? DEFAULT_EXAM_PRICE,
-      totalAmount: pricing.examUnlockPrice ?? DEFAULT_EXAM_PRICE,
-      maxQuestionsPerSession: 30,
-      appleProductId: expectedProductId,
+  const storePurchasedAt = transaction.purchase_date_ms
+    ? new Date(Number(transaction.purchase_date_ms))
+    : new Date();
+  const isLegacyProduct = payload.productId === legacyProductId;
+  const legacyWindow = isLegacyProduct
+    ? buildLegacyExamEntitlementWindow(storePurchasedAt)
+    : null;
+  const startedAt = legacyWindow?.startedAt || storePurchasedAt;
+  const storeExpiresAt = legacyWindow?.expiresAt || (transaction.expires_date_ms
+    ? new Date(Number(transaction.expires_date_ms))
+    : addExamAccessMonths(startedAt));
+  const { access: updatedAccess } = await grantExamEntitlement({
+    userId,
+    examId,
+    source: isLegacyProduct ? "legacy" : "exam_subscription",
+    provider: "apple",
+    amount: pricing.examUnlockPrice ?? DEFAULT_EXAM_PRICE,
+    currency: pricing.currency || DEFAULT_CURRENCY,
+    startedAt,
+    expiresAt: storeExpiresAt,
+    externalTransactionId: appleTransactionId,
+    originalTransactionId: appleOriginalTransactionId,
+    productId: payload.productId,
+    paymentFields: {
+      appleProductId: payload.productId,
       appleTransactionId,
       appleOriginalTransactionId,
       paymentAccountFingerprint: appleOriginalTransactionId
         ? `apple:${appleOriginalTransactionId}`
         : "",
-      purchasedAt: transaction.purchase_date_ms
-        ? new Date(Number(transaction.purchase_date_ms))
-        : new Date(),
-      metadata: {
-        provider: "apple",
-        appleEnvironment: verification.environment || "",
-        appleReceiptStatus: verification.status,
-        purchaseStatus: payload.purchaseStatus,
-        verificationSource: payload.source,
-      },
-    }
-  );
+    },
+    metadata: {
+      appleEnvironment: verification.environment || "",
+      appleReceiptStatus: verification.status,
+      purchaseStatus: payload.purchaseStatus,
+      verificationSource: payload.source,
+    },
+  });
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
@@ -1856,6 +1895,9 @@ export const verifyAppleExamPurchase = catchAsync(async (req, res) => {
       transactionReference: appleTransactionId,
       paidAt: updatedAccess.purchasedAt,
       provider: "apple",
+      startedAt: updatedAccess.startedAt,
+      expiresAt: updatedAccess.expiresAt,
+      durationMonths: 6,
       access: updatedAccess,
     },
   });
@@ -1873,14 +1915,22 @@ export const verifyAppleProfessionalPlanPurchase = catchAsync(async (req, res) =
   const user = await User.findById(userId);
   if (!user) throw new AppError(httpStatus.NOT_FOUND, "User not found");
 
-  let examId = req.body?.examId?.toString().trim() || "";
-  let exam = examId ? await Exam.findById(examId).lean() : null;
-  if (!exam) {
-    exam = await Exam.findOne({ status: "active" }).sort({ createdAt: 1 }).lean();
-    examId = exam?._id?.toString() || "";
-  }
-  if (!exam || !examId) {
-    throw new AppError(httpStatus.NOT_FOUND, "No active exam found for plan unlock");
+  const examId = req.body?.examId?.toString().trim() || "";
+  if (!examId) throw new AppError(httpStatus.BAD_REQUEST, "examId is required");
+  const exam = await Exam.findOne({ _id: examId, status: "active" }).lean();
+  if (!exam) throw new AppError(httpStatus.NOT_FOUND, "Active exam not found");
+  const existingInitialPurchase = await ProfessionalPlanPurchase.findOne({
+    userId,
+    status: "completed",
+  }).lean();
+  if (
+    existingInitialPurchase?.examId &&
+    existingInitialPurchase.examId.toString() !== examId
+  ) {
+    throw new AppError(
+      httpStatus.CONFLICT,
+      "The included exam was already selected for the initial purchase"
+    );
   }
 
   const verification = await verifyAppleReceipt(payload.receiptData);
@@ -1941,29 +1991,27 @@ export const verifyAppleProfessionalPlanPurchase = catchAsync(async (req, res) =
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
 
-  const updatedAccess = await upsertExamAccessSafely(
-    { userId, examId },
-    {
-      userId,
-      examId,
-      status: "unlocked",
-      paymentStatus: "completed",
-      purchaseType: "plan",
-      currency: pricing.currency || DEFAULT_CURRENCY,
-      purchasePrice: planPurchase.planFinalPrice,
-      totalAmount: planPurchase.totalAmount,
-      maxQuestionsPerSession: 30,
+  const { access: updatedAccess } = await grantExamEntitlement({
+    userId,
+    examId,
+    source: "initial_included",
+    provider: "apple",
+    amount: 0,
+    currency: pricing.currency || DEFAULT_CURRENCY,
+    startedAt: subscriptionStartedAt,
+    expiresAt: subscriptionExpiresAt,
+    externalTransactionId: appleTransactionId,
+    originalTransactionId: appleOriginalTransactionId,
+    productId: APPLE_PROFESSIONAL_PRODUCT_ID,
+    purchaseType: "plan",
+    paymentFields: {
       appleProductId: APPLE_PROFESSIONAL_PRODUCT_ID,
       appleTransactionId,
       appleOriginalTransactionId,
       paymentAccountFingerprint: planPurchase.paymentAccountFingerprint,
-      purchasedAt: planPurchase.purchasedAt,
-      metadata: {
-        provider: "apple",
-        planPurchaseId: planPurchase._id,
-      },
-    }
-  );
+    },
+    metadata: { planPurchaseId: planPurchase._id },
+  });
 
   await User.findByIdAndUpdate(userId, {
     subscriptionTier: "professional",
@@ -2013,15 +2061,11 @@ export const createExamPayPalOrder = catchAsync(async (req, res) => {
   ]);
   if (!user) throw new AppError(httpStatus.NOT_FOUND, "User not found");
   if (!exam) throw new AppError(httpStatus.NOT_FOUND, "Exam not found");
+  assertCanPurchaseAdditionalExam(user);
 
   const existingAccess = await ExamAccess.findOne({ userId, examId });
-  if (existingAccess?.status === "unlocked") {
-    return sendResponse(res, {
-      statusCode: httpStatus.OK,
-      success: true,
-      message: "Exam already unlocked",
-      data: { unlocked: true },
-    });
+  if (isExamEntitlementActive(existingAccess)) {
+    throw new AppError(httpStatus.CONFLICT, "Exam subscription is already active");
   }
 
   const {
@@ -2114,6 +2158,15 @@ export const createExamPayPalOrder = catchAsync(async (req, res) => {
     },
     { new: true }
   );
+  await recordPendingExamSubscription({
+    userId,
+    examId,
+    examAccessId: accessDoc._id,
+    provider: "paypal",
+    externalTransactionId: orderData.id,
+    amount: totalAmount,
+    currency: pricing.currency,
+  });
 
   const approvalLink =
     orderData.links?.find((l) => l.rel === "approve")?.href || null;
@@ -2156,7 +2209,7 @@ export const captureExamPayPalOrder = catchAsync(async (req, res) => {
   }
 
   const accessDoc = await ExamAccess.findOne({ userId, examId });
-  if (accessDoc?.status === "unlocked") {
+  if (isExamEntitlementActive(accessDoc)) {
     return sendResponse(res, {
       statusCode: httpStatus.OK,
       success: true,
@@ -2196,28 +2249,30 @@ export const captureExamPayPalOrder = catchAsync(async (req, res) => {
       status: "failed",
       reason: "PayPal capture not completed",
     });
+    await markExamSubscriptionTransactionStatus({
+      provider: "paypal",
+      externalTransactionId: orderId,
+      status: "failed",
+      reason: "PayPal capture not completed",
+    });
     throw new AppError(httpStatus.BAD_GATEWAY, "PayPal capture not completed");
   }
 
   const paymentFingerprint = buildPayPalPaymentAccountFingerprint(captureData);
 
-  const updatedAccess = await ExamAccess.findOneAndUpdate(
-    { userId, examId },
-    {
-      userId,
-      examId,
-      status: "unlocked",
-      paymentStatus: "completed",
+  const { access: updatedAccess } = await grantExamEntitlement({
+    userId,
+    examId,
+    source: "exam_subscription",
+    provider: "paypal",
+    amount: accessDoc?.purchasePrice || accessDoc?.totalAmount || DEFAULT_EXAM_PRICE,
+    currency: accessDoc?.currency || DEFAULT_CURRENCY,
+    externalTransactionId: orderId,
+    paymentFields: {
       paypalOrderId: orderId,
-      purchaseType: "exam",
-      accessDuration: "lifetime",
-      expiresAt: null,
-      maxQuestionsPerSession: 30,
       paymentAccountFingerprint: paymentFingerprint,
-      purchasedAt: new Date(),
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
+  });
 
   let addonPurchase = null;
   let addonPurchases = [];
@@ -2248,6 +2303,9 @@ export const captureExamPayPalOrder = catchAsync(async (req, res) => {
       transactionReference: buildPayPalTransactionReference(captureData, orderId),
       paidAt: updatedAccess.purchasedAt,
       provider: "paypal",
+      startedAt: updatedAccess.startedAt,
+      expiresAt: updatedAccess.expiresAt,
+      durationMonths: 6,
       access: updatedAccess,
       addonPurchase,
       addonPurchases,
@@ -2264,8 +2322,8 @@ export const createProfessionalPlanOrder = catchAsync(async (req, res) => {
 
   const user = await User.findById(userId);
   if (!user) throw new AppError(httpStatus.NOT_FOUND, "User not found");
-  if (hasActiveProfessionalSubscription(user)) {
-    throw new AppError(httpStatus.BAD_REQUEST, "User already has professional plan");
+  if (await hasCompletedProfessionalPurchase(userId)) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Initial subscription has already been purchased");
   }
 
   const exam = await Exam.findById(examId).lean();
@@ -2344,6 +2402,7 @@ export const createProfessionalPlanOrder = catchAsync(async (req, res) => {
       amount: planPurchase.totalAmount,
       currency: pricing.currency,
       examId,
+      pendingSelectionReference: planPurchase._id,
       breakdown: {
         planBasePrice: planPurchase.planBasePrice,
         referralDiscountAmount: planPurchase.referralDiscountAmount,
@@ -2432,23 +2491,26 @@ export const captureProfessionalPlanOrder = catchAsync(async (req, res) => {
     throw new AppError(httpStatus.BAD_GATEWAY, "PayPal capture not completed");
   }
 
-  const updatedAccess = await upsertExamAccessSafely(
-    { userId, examId: planPurchase.examId },
-    {
-      userId,
-      examId: planPurchase.examId,
-      paypalOrderId: orderId,
-      status: "unlocked",
-      paymentStatus: "completed",
-      purchaseType: "plan",
-      purchasePrice: planPurchase.planFinalPrice,
-      maxQuestionsPerSession: 30,
-      purchasedAt: new Date(),
-    }
-  );
-
   const { subscriptionStartedAt, subscriptionExpiresAt, intervalLabel } =
     await buildProfessionalSubscriptionWindow();
+
+  const { access: updatedAccess } = await grantExamEntitlement({
+    userId,
+    examId: planPurchase.examId,
+    source: "initial_included",
+    provider: "paypal",
+    amount: 0,
+    currency: planPurchase.currency || DEFAULT_CURRENCY,
+    startedAt: subscriptionStartedAt,
+    expiresAt: subscriptionExpiresAt,
+    externalTransactionId: orderId,
+    purchaseType: "plan",
+    paymentFields: { paypalOrderId: orderId },
+    metadata: {
+      includedWithInitialPrice: planPurchase.planFinalPrice,
+      planPurchaseId: planPurchase._id,
+    },
+  });
 
   await User.findByIdAndUpdate(userId, {
     subscriptionTier: "professional",
@@ -2583,6 +2645,15 @@ export const updateProfessionalPlanPurchaseStatus = catchAsync(async (req, res) 
         },
       }
     );
+
+    if (["cancelled", "refunded"].includes(status) && purchase.examId) {
+      await revokeExamEntitlement({
+        userId: purchase.userId,
+        examId: purchase.examId,
+        reason: reason || `Initial purchase ${status}`,
+        transactionStatus: status === "refunded" ? "refunded" : "revoked",
+      });
+    }
   }
 
   sendResponse(res, {
@@ -2597,8 +2668,12 @@ export const getUserTransactions = catchAsync(async (req, res) => {
   const { userId } = req.params;
   if (!userId) throw new AppError(httpStatus.BAD_REQUEST, "userId is required");
 
-  const [planPurchases, resourcePurchases] = await Promise.all([
+  const [planPurchases, examSubscriptions, resourcePurchases] = await Promise.all([
     ProfessionalPlanPurchase.find({ userId })
+      .populate("examId", "name")
+      .sort({ createdAt: -1 })
+      .lean(),
+    ExamSubscriptionTransaction.find({ userId })
       .populate("examId", "name")
       .sort({ createdAt: -1 })
       .lean(),
@@ -2610,6 +2685,7 @@ export const getUserTransactions = catchAsync(async (req, res) => {
 
   const transactions = [
     ...planPurchases.map((p) => ({ ...p, transactionType: "plan" })),
+    ...examSubscriptions.map((p) => ({ ...p, transactionType: "exam" })),
     ...resourcePurchases.map((p) => ({ ...p, transactionType: "resource" })),
   ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
@@ -2641,19 +2717,23 @@ export const processRefund = catchAsync(async (req, res) => {
   if (!["full", "partial"].includes(type)) {
     throw new AppError(httpStatus.BAD_REQUEST, "type must be 'full' or 'partial'");
   }
-  if (!["plan", "resource"].includes(transactionType)) {
-    throw new AppError(httpStatus.BAD_REQUEST, "transactionType must be 'plan' or 'resource'");
+  if (!["plan", "exam", "resource"].includes(transactionType)) {
+    throw new AppError(httpStatus.BAD_REQUEST, "transactionType must be 'plan', 'exam', or 'resource'");
   }
 
-  const Model =
-    transactionType === "plan" ? ProfessionalPlanPurchase : ResourcePurchase;
+  const Model = transactionType === "plan"
+    ? ProfessionalPlanPurchase
+    : transactionType === "exam"
+      ? ExamSubscriptionTransaction
+      : ResourcePurchase;
   const transaction = await Model.findById(transactionId);
 
   if (!transaction) {
     throw new AppError(httpStatus.NOT_FOUND, "Transaction not found");
   }
 
-  const paidAmount = transaction.totalAmount ?? transaction.finalPrice ?? 0;
+  const paidAmount =
+    transaction.totalAmount ?? transaction.finalPrice ?? transaction.amount ?? 0;
   const alreadyRefunded = transaction.refundedAmount || 0;
   const refundable = paidAmount - alreadyRefunded;
 
@@ -2666,6 +2746,12 @@ export const processRefund = catchAsync(async (req, res) => {
     throw new AppError(
       httpStatus.BAD_REQUEST,
       "RevenueCat store transactions support full refunds only"
+    );
+  }
+  if (provider === "revenuecat" && transactionType === "exam") {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      "Refund this exam subscription through RevenueCat or the store; the webhook will revoke only that exam"
     );
   }
   if (provider === "apple") {
@@ -2698,7 +2784,10 @@ export const processRefund = catchAsync(async (req, res) => {
   let paypalRefundId = "";
   let revenueCatRefundId = "";
   if (provider === "stripe") {
-    if (!transaction.stripePaymentIntentId) {
+    const stripePaymentIntentId =
+      transaction.stripePaymentIntentId ||
+      (transactionType === "exam" ? transaction.externalTransactionId : "");
+    if (!stripePaymentIntentId) {
       throw new AppError(
         httpStatus.BAD_REQUEST,
         "Stripe payment intent ID is missing from this transaction"
@@ -2707,14 +2796,17 @@ export const processRefund = catchAsync(async (req, res) => {
     const stripe = getStripeClient();
     const currency = transaction.currency ?? "USD";
     const stripeRefund = await stripe.refunds.create({
-      payment_intent: transaction.stripePaymentIntentId,
+      payment_intent: stripePaymentIntentId,
       amount: toStripeAmount(refundAmount, currency),
       reason: "requested_by_customer",
     });
     stripeRefundId = stripeRefund.id;
   } else if (provider === "paypal") {
     const paypalRefund = await refundPayPalTransaction({
-      transaction,
+      transaction:
+        transactionType === "exam"
+          ? { ...transaction.toObject(), paypalOrderId: transaction.externalTransactionId }
+          : transaction,
       amount: refundAmount,
       currency: transaction.currency,
     });
@@ -2761,6 +2853,16 @@ export const processRefund = catchAsync(async (req, res) => {
     await transaction.save();
   }
 
+  if (isFullyRefunded && transactionType === "exam") {
+    await revokeExamEntitlement({
+      userId: transaction.userId,
+      examId: transaction.examId,
+      externalTransactionId: transaction.externalTransactionId,
+      reason,
+      transactionStatus: "refunded",
+    });
+  }
+
   const subscribedUser =
     transactionType === "plan" && isFullyRefunded
       ? await User.findById(transaction.userId)
@@ -2771,27 +2873,18 @@ export const processRefund = catchAsync(async (req, res) => {
     shouldRevokeCurrentSubscription(subscribedUser, provider);
 
   if (revokeCurrentPlan) {
-    await Promise.all([
-      User.findByIdAndUpdate(transaction.userId, {
-        subscriptionTier: "starter",
-        subscriptionStartedAt: null,
-        subscriptionExpiresAt: null,
-        subscriptionProvider: "",
-        subscriptionExternalId: "",
-        subscriptionWillRenew: null,
-      }),
-      ExamAccess.updateMany(
-        planAccessRefundFilter(transaction, provider),
-        {
-          $set: {
-            status: "free",
-            paymentStatus: "refunded",
-            maxQuestionsPerSession: 2,
-            purchasedAt: null,
-          },
-        }
-      ),
-    ]);
+    if (transaction.examId) {
+      await revokeExamEntitlement({
+        userId: transaction.userId,
+        examId: transaction.examId,
+        reason: "Initial purchase refunded",
+      });
+    }
+    await User.findByIdAndUpdate(transaction.userId, {
+      subscriptionTier: "professional",
+      subscriptionWillRenew: false,
+      subscriptionRevokedAt: new Date(),
+    });
   }
 
   if (isFullyRefunded) {
@@ -2814,8 +2907,11 @@ export const getTransactionRefunds = catchAsync(async (req, res) => {
     throw new AppError(httpStatus.BAD_REQUEST, "transactionId and transactionType are required");
   }
 
-  const Model =
-    transactionType === "plan" ? ProfessionalPlanPurchase : ResourcePurchase;
+  const Model = transactionType === "plan"
+    ? ProfessionalPlanPurchase
+    : transactionType === "exam"
+      ? ExamSubscriptionTransaction
+      : ResourcePurchase;
   const transaction = await Model.findById(transactionId)
     .populate("refundHistory.adminId", "firstName lastName email")
     .lean();
@@ -2831,7 +2927,8 @@ export const getTransactionRefunds = catchAsync(async (req, res) => {
     data: {
       transactionId,
       transactionType,
-      totalAmount: transaction.totalAmount ?? transaction.finalPrice ?? 0,
+      totalAmount:
+        transaction.totalAmount ?? transaction.finalPrice ?? transaction.amount ?? 0,
       refundedAmount: transaction.refundedAmount || 0,
       refundStatus: transaction.refundStatus || "none",
       refundHistory: transaction.refundHistory || [],
@@ -2852,22 +2949,14 @@ export const manualUnlockExam = catchAsync(async (req, res) => {
   const exam = await Exam.findById(examId).lean();
   if (!exam) throw new AppError(httpStatus.NOT_FOUND, "Exam not found");
 
-  const updatedAccess = await ExamAccess.findOneAndUpdate(
-    { userId, examId },
-    {
-      userId,
-      examId,
-      status: "unlocked",
-      paymentStatus: "manual",
-      purchaseType: "manual",
-      accessDuration: "lifetime",
-      expiresAt: null,
-      purchasePrice: 0,
-      maxQuestionsPerSession: 30,
-      purchasedAt: new Date(),
-    },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
+  const { access: updatedAccess } = await grantExamEntitlement({
+    userId,
+    examId,
+    source: "manual",
+    provider: "manual",
+    amount: 0,
+    purchaseType: "manual",
+  });
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
@@ -2898,28 +2987,17 @@ export const manualUnlockExamsBulk = catchAsync(async (req, res) => {
     );
   }
 
-  const unlockedAt = new Date();
-
-  await ExamAccess.bulkWrite(
-    examIds.map((examId) => ({
-      updateOne: {
-        filter: { userId, examId },
-        update: {
-          userId,
-          examId,
-          status: "unlocked",
-          paymentStatus: "manual",
-          purchaseType: "manual",
-          accessDuration: "lifetime",
-          expiresAt: null,
-          purchasePrice: 0,
-          maxQuestionsPerSession: 30,
-          purchasedAt: unlockedAt,
-        },
-        upsert: true,
-        setDefaultsOnInsert: true,
-      },
-    }))
+  await Promise.all(
+    examIds.map((examId) =>
+      grantExamEntitlement({
+        userId,
+        examId,
+        source: "manual",
+        provider: "manual",
+        amount: 0,
+        purchaseType: "manual",
+      })
+    )
   );
 
   const unlockedAccesses = await ExamAccess.find({
@@ -2953,7 +3031,11 @@ export const manualLockExam = catchAsync(async (req, res) => {
   const exam = await Exam.findById(examId).lean();
   if (!exam) throw new AppError(httpStatus.NOT_FOUND, "Exam not found");
 
-  const existingAccess = await ExamAccess.findOne({ userId, examId, status: "unlocked" });
+  const existingAccess = await ExamAccess.findOne({
+    userId,
+    examId,
+    status: { $in: ["active", "unlocked"] },
+  });
   if (!existingAccess) {
     return sendResponse(res, {
       statusCode: httpStatus.OK,
@@ -2963,9 +3045,12 @@ export const manualLockExam = catchAsync(async (req, res) => {
     });
   }
 
-  existingAccess.status = "free";
+  existingAccess.status = "revoked";
   existingAccess.maxQuestionsPerSession = 2;
-  existingAccess.purchasedAt = null;
+  existingAccess.metadata = {
+    ...(existingAccess.metadata || {}),
+    revocationReason: "Manual lock",
+  };
   await existingAccess.save();
 
   sendResponse(res, {
@@ -3000,12 +3085,12 @@ export const manualLockExamsBulk = catchAsync(async (req, res) => {
   await ExamAccess.bulkWrite(
     examIds.map((examId) => ({
       updateOne: {
-        filter: { userId, examId, status: "unlocked" },
+        filter: { userId, examId, status: { $in: ["active", "unlocked"] } },
         update: {
           $set: {
-            status: "free",
+            status: "revoked",
             maxQuestionsPerSession: 2,
-            purchasedAt: null,
+            "metadata.revocationReason": "Manual lock",
           },
         },
       },
@@ -3206,6 +3291,10 @@ export const getProfessionalPlan = catchAsync(async (req, res) => {
         },
         description,
         features,
+        initialPrice: price,
+        examSubscriptionPrice: unlockExamPrice,
+        durationMonths: 6,
+        renewalMode: "manual",
         referralEligible: referralState.referralEligible,
         referralOffer: referralState.referralOffer,
       },
@@ -3215,18 +3304,19 @@ export const getProfessionalPlan = catchAsync(async (req, res) => {
 });
 
 export const getRevenueSummary = catchAsync(async (req, res) => {
-  const [examRevenueAgg] = await ExamAccess.aggregate([
+  const [examRevenueAgg] = await ExamSubscriptionTransaction.aggregate([
     {
       $match: {
-        status: "unlocked",
-        paymentStatus: "completed",
-        purchaseType: "exam",
+        status: "completed",
+        source: "exam_subscription",
       },
     },
     {
       $group: {
         _id: null,
-        totalRevenue: { $sum: "$purchasePrice" },
+        totalRevenue: {
+          $sum: { $subtract: ["$amount", { $ifNull: ["$refundedAmount", 0] }] },
+        },
         totalUnlockedExams: { $sum: 1 },
       },
     },
@@ -3272,12 +3362,11 @@ export const getRevenueSummary = catchAsync(async (req, res) => {
     today.getDate() - 6
   );
 
-  const examDailyRevenue = await ExamAccess.aggregate([
+  const examDailyRevenue = await ExamSubscriptionTransaction.aggregate([
     {
       $match: {
-        status: "unlocked",
-        paymentStatus: "completed",
-        purchaseType: "exam",
+        status: "completed",
+        source: "exam_subscription",
         createdAt: { $gte: startDate },
       },
     },
@@ -3286,7 +3375,9 @@ export const getRevenueSummary = catchAsync(async (req, res) => {
         _id: {
           $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
         },
-        revenue: { $sum: "$purchasePrice" },
+        revenue: {
+          $sum: { $subtract: ["$amount", { $ifNull: ["$refundedAmount", 0] }] },
+        },
         count: { $sum: 1 },
       },
     },

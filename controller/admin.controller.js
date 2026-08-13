@@ -44,7 +44,7 @@ export const getDashboardOverview = catchAsync(async (req, res) => {
   const [revenueAgg] = await ExamAccess.aggregate([
     {
       $match: {
-        status: "unlocked",
+        status: { $in: ["active", "unlocked"] },
         paymentStatus: "completed",
       },
     },
@@ -58,7 +58,7 @@ export const getDashboardOverview = catchAsync(async (req, res) => {
   const dailyAgg = await ExamAccess.aggregate([
     {
       $match: {
-        status: "unlocked",
+        status: { $in: ["active", "unlocked"] },
         paymentStatus: "completed",
         createdAt: { $gte: sevenDaysAgo },
       },

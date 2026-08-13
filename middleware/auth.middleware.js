@@ -19,28 +19,9 @@ const getStoredInstallationId = (user) =>
   normalizeInstallationId(user?.activeInstallationId || user?.activeDeviceId);
 
 const normalizeExpiredProfessionalSubscription = async (user) => {
-  if (!user) return user;
-  const isProfessional =
-    user.subscriptionTier?.toString().toLowerCase() === "professional";
-  if (!isProfessional) return user;
-
-  const now = new Date();
-  const expiresAt = user.subscriptionExpiresAt
-    ? new Date(user.subscriptionExpiresAt)
-    : null;
-
-  if (expiresAt && expiresAt.getTime() > now.getTime()) {
-    return user;
-  }
-
-  user.subscriptionTier = "starter";
-  user.subscriptionStartedAt = null;
-  user.subscriptionExpiresAt = null;
-  user.subscriptionProvider = "";
-  user.subscriptionExternalId = "";
-  user.subscriptionWillRenew = null;
-  user.subscriptionRevokedAt = null;
-  await user.save();
+  // Professional is now an account-level marker. ExamAccess.expiresAt controls
+  // access independently, so an expired initial period must not downgrade the
+  // whole account to Starter.
   return user;
 };
 

@@ -15,6 +15,7 @@
     "migrate:referral-rewards": "node scripts/backfillReferralRewards.js",
     "migrate:referral-reward-indexes": "node scripts/fixReferralRewardIndexes.js",
     "migrate:exam-ownership": "node scripts/migrateExamOwnership.js",
+    "migrate:exam-subscriptions": "node scripts/migrateExamOwnership.js",
     "inspect:referral-case": "node scripts/inspectReferralCase.js"
   },
   "author": "",

@@ -2,11 +2,11 @@ import mongoose, { Schema } from "mongoose";
 
 const appSettingSchema = new Schema(
   {
-    professionalPlanPrice: { type: Number, default: 180 },
+    professionalPlanPrice: { type: Number, default: 199.99 },
     examUnlockPrice: { type: Number, default: 150 },
     referralCommissionRate: { type: Number, default: 0.1, min: 0, max: 1 },
     currency: { type: String, default: "USD" },
-    professionalPlanIntervalCount: { type: Number, default: 3 },
+    professionalPlanIntervalCount: { type: Number, default: 6 },
     professionalPlanIntervalUnit: { type: String, default: "months" },
     professionalPlanDescription: {
       type: String,
@@ -15,7 +15,7 @@ const appSettingSchema = new Schema(
     professionalPlanFeatures: {
       type: [String],
       default: [
-        "Access to selected free exams",
+        "One selected exam included for 6 months",
         "Full-length mock exams",
         "Timed & full simulation modes",
         "Interactive study mode",

@@ -7,6 +7,12 @@ import { ProfessionalPlanPurchase } from "../model/professionalPlanPurchase.mode
 import { User } from "../model/user.model.js";
 import { buildSelectedExamUnlockResponse } from "./examAccess.helpers.js";
 import {
+  addExamAccessMonths,
+  buildLegacyExamEntitlementWindow,
+  grantExamEntitlement,
+  revokeExamEntitlement,
+} from "./examSubscription.service.js";
+import {
   internalProductIdentifierFromObject,
   isRevenueCatRefundEvent,
   productIdentifierFromObject,
@@ -24,6 +30,25 @@ const MAX_PAGES = 20;
 const productStoreIdentifierCache = new Map();
 
 const EXAM_PRODUCT_CODES = new Map([
+  ["com.inspectorspath.exam.api1184.sixmonth", "API_1184"],
+  ["com.inspectorspath.exam.api510.sixmonth", "API_510"],
+  ["com.inspectorspath.exam.api570.sixmonth", "API_570"],
+  ["com.inspectorspath.exam.api653.sixmonth", "API_653"],
+  ["com.inspectorspath.exam.api936.sixmonth", "API_936"],
+  ["com.inspectorspath.exam.api1169.sixmonth", "API_1169"],
+  ["com.inspectorspath.exam.siee.sixmonth", "API_SIEE"],
+  ["com.inspectorspath.exam.sife.sixmonth", "API_SIFE"],
+  ["com.inspectorspath.exam.sire.sixmonth", "API_SIRE"],
+  ["com.inspectorspath.exam.api1184.sixmonth:api1184sixmonth", "API_1184"],
+  ["com.inspectorspath.exam.api510.sixmonth:api510sixmonth", "API_510"],
+  ["com.inspectorspath.exam.api570.sixmonth:api570sixmonth", "API_570"],
+  ["com.inspectorspath.exam.api653.sixmonth:api653sixmonth", "API_653"],
+  ["com.inspectorspath.exam.api936.sixmonth:api936sixmonth", "API_936"],
+  ["com.inspectorspath.exam.api1169.sixmonth:api1169sixmonth", "API_1169"],
+  ["com.inspectorspath.exam.siee.sixmonth:sieesixmonth", "API_SIEE"],
+  ["com.inspectorspath.exam.sife.sixmonth:sifesixmonth", "API_SIFE"],
+  ["com.inspectorspath.exam.sire.sixmonth:siresixmonth", "API_SIRE"],
+  // Legacy one-time identifiers are read for migration/restore only.
   ["com.inspectorspath.exam.api1184.unlock", "API_1184"],
   ["com.inspectorspath.exam.api510.unlock", "API_510"],
   ["com.inspectorspath.exam.api570.unlock", "API_570"],
@@ -355,49 +380,31 @@ const unlockExamFromRevenueCat = async ({
   purchasedAt = new Date(),
   currency = "USD",
   price = 0,
-  accessDuration = purchaseType === "plan" ? "subscription" : "lifetime",
+  accessDuration = "six_months",
   expiresAt = null,
-}) =>
-  ExamAccess.findOneAndUpdate(
-    { userId, examId: exam._id },
-    {
-      $set: {
-        userId,
-        examId: exam._id,
-        status: "unlocked",
-        purchaseType,
-        currency: clean(currency).toUpperCase() || "USD",
-        purchasePrice: Math.max(0, safeNumber(price)),
-        totalAmount: Math.max(0, safeNumber(price)),
-        maxQuestionsPerSession: 30,
-        paymentStatus: "completed",
-        purchasedAt,
-        accessDuration,
-        expiresAt: accessDuration === "lifetime" ? null : expiresAt,
-        revenueCatProductId: clean(productId),
-        revenueCatTransactionId: clean(transactionId),
-        revenueCatOriginalTransactionId: clean(originalTransactionId),
-        "metadata.provider": "revenuecat",
-      },
+  source = purchaseType === "plan" ? "initial_included" : "exam_subscription",
+}) => {
+  const result = await grantExamEntitlement({
+    userId,
+    examId: exam._id,
+    source,
+    provider: "revenuecat",
+    amount: price,
+    currency,
+    startedAt: purchasedAt,
+    expiresAt: expiresAt || addExamAccessMonths(purchasedAt),
+    externalTransactionId: clean(transactionId),
+    originalTransactionId: clean(originalTransactionId),
+    productId: clean(productId),
+    purchaseType,
+    paymentFields: {
+      revenueCatProductId: clean(productId),
+      revenueCatTransactionId: clean(transactionId),
+      revenueCatOriginalTransactionId: clean(originalTransactionId),
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
-
-const revokeRevenueCatPlanAccess = async (userId, paymentStatus = "voided") => {
-  await ExamAccess.updateMany(
-    {
-      userId,
-      purchaseType: "plan",
-      "metadata.provider": "revenuecat",
-    },
-    {
-      $set: {
-        status: "free",
-        paymentStatus,
-        maxQuestionsPerSession: 2,
-      },
-    }
-  );
+    metadata: { provider: "revenuecat", accessDuration },
+  });
+  return result.access;
 };
 
 const revocationMatchesCurrentSubscription = (user, subscription) => {
@@ -409,14 +416,15 @@ const revocationMatchesCurrentSubscription = (user, subscription) => {
 
 const downgradeRevenueCatSubscription = async ({ user, subscription } = {}) => {
   if (!user) return null;
-  user.subscriptionTier = "starter";
+  // The initial purchase permanently establishes the account tier. Individual
+  // exam entitlements expire/revoke independently.
+  user.subscriptionTier = "professional";
   user.subscriptionProvider = "revenuecat";
   user.subscriptionExternalId =
     clean(subscription?.id) || clean(user.subscriptionExternalId);
   user.subscriptionWillRenew = false;
   user.subscriptionRevokedAt = user.subscriptionRevokedAt || new Date();
   await user.save();
-  await revokeRevenueCatPlanAccess(user._id);
   return user;
 };
 
@@ -477,6 +485,22 @@ export const syncRevenueCatCustomerAccess = async ({
         "RevenueCat product does not match the selected exam"
       );
     }
+    if (user.subscriptionTier !== "professional" && !state.hasProfessionalAccess) {
+      throw new AppError(
+        httpStatus.FORBIDDEN,
+        "Complete the initial subscription before purchasing another exam"
+      );
+    }
+  }
+
+  const requestedProfessionalPurchase = isProfessionalProduct(
+    normalizedRequestedProductId
+  );
+  if (requestedProfessionalPurchase && !requestedExam) {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      "examId is required for the initial subscription purchase"
+    );
   }
 
   if (state.hasProfessionalAccess) {
@@ -490,8 +514,6 @@ export const syncRevenueCatCustomerAccess = async ({
       (user.subscriptionExpiresAt && user.subscriptionExpiresAt > now
         ? user.subscriptionExpiresAt
         : new Date("9999-12-31T23:59:59.999Z"));
-    const requestedProfessionalPurchase =
-      isProfessionalProduct(requestedProductId);
     const cancellationStillApplies =
       !forceProfessionalActivation &&
       !requestedProfessionalPurchase &&
@@ -513,15 +535,163 @@ export const syncRevenueCatCustomerAccess = async ({
       await user.save();
     }
   } else if (user.subscriptionProvider === "revenuecat") {
-    user.subscriptionTier = "starter";
-    user.subscriptionStartedAt = null;
-    user.subscriptionExpiresAt = null;
-    user.subscriptionProvider = "";
-    user.subscriptionExternalId = "";
+    user.subscriptionTier = "professional";
     user.subscriptionWillRenew = null;
-    user.subscriptionRevokedAt = null;
     await user.save();
-    await revokeRevenueCatPlanAccess(user._id);
+  }
+
+  if (requestedProfessionalPurchase) {
+    if (!state.hasProfessionalAccess) {
+      throw new AppError(
+        httpStatus.PAYMENT_REQUIRED,
+        "RevenueCat has not confirmed the initial subscription"
+      );
+    }
+    const subscription = state.currentProfessionalSubscription;
+    const subscriptionId = clean(subscription?.id) || normalizedRequestedProductId;
+    const existingInitialPurchase = await ProfessionalPlanPurchase.findOne({
+      userId: user._id,
+      provider: "revenuecat",
+      status: "completed",
+    });
+    if (
+      existingInitialPurchase?.examId &&
+      existingInitialPurchase.examId.toString() !== requestedExam._id.toString()
+    ) {
+      throw new AppError(
+        httpStatus.CONFLICT,
+        "The included exam was already selected for this initial purchase"
+      );
+    }
+    const startsAt =
+      dateFromMillis(subscription?.starts_at || subscription?.current_period_starts_at) ||
+      user.subscriptionStartedAt ||
+      now;
+    const expiresAt = state.professionalExpiresAt || addExamAccessMonths(startsAt);
+    const planPurchase = await ProfessionalPlanPurchase.findOneAndUpdate(
+      existingInitialPurchase ? { _id: existingInitialPurchase._id } : {
+        userId: user._id,
+        provider: "revenuecat",
+        revenueCatSubscriptionId: subscriptionId,
+      },
+      {
+        $set: {
+          userId: user._id,
+          examId: requestedExam._id,
+          provider: "revenuecat",
+          status: "completed",
+          currency: "USD",
+          planBasePrice: 199.99,
+          planFinalPrice: 199.99,
+          totalAmount: 199.99,
+          revenueCatAppUserId: user._id.toString(),
+          revenueCatProductId: normalizedRequestedProductId,
+          revenueCatSubscriptionId: subscriptionId,
+          purchasedAt: startsAt,
+          "metadata.initialExamExpiresAt": expiresAt,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    const access = await unlockExamFromRevenueCat({
+      userId: user._id,
+      exam: requestedExam,
+      productId: normalizedRequestedProductId,
+      transactionId: subscriptionId,
+      purchaseType: "plan",
+      source: "initial_included",
+      purchasedAt: startsAt,
+      expiresAt,
+      price: 0,
+    });
+    access.metadata = {
+      ...(access.metadata || {}),
+      includedWithInitialPrice: planPurchase.planFinalPrice,
+      planPurchaseId: planPurchase._id,
+    };
+    await access.save();
+    selectedExam = buildSelectedExamUnlockResponse({
+      exam: requestedExam,
+      access,
+    });
+    syncedExamIds.add(requestedExam._id.toString());
+  }
+
+  if (!requestedProfessionalPurchase && state.hasProfessionalAccess) {
+    const initialPurchase = await ProfessionalPlanPurchase.findOne({
+      userId: user._id,
+      provider: "revenuecat",
+      status: "completed",
+      examId: { $ne: null },
+    }).sort({ purchasedAt: 1 });
+    if (initialPurchase?.examId) {
+      const existingAccess = await ExamAccess.findOne({
+        userId: user._id,
+        examId: initialPurchase.examId,
+      });
+      if (!existingAccess) {
+        const initialExam = await Exam.findById(initialPurchase.examId);
+        if (initialExam) {
+          const startsAt = initialPurchase.purchasedAt || now;
+          const expiresAt = initialPurchase.metadata?.initialExamExpiresAt ||
+            addExamAccessMonths(startsAt);
+          await unlockExamFromRevenueCat({
+            userId: user._id,
+            exam: initialExam,
+            productId: initialPurchase.revenueCatProductId,
+            transactionId:
+              initialPurchase.revenueCatSubscriptionId ||
+              initialPurchase.revenueCatTransactionId,
+            originalTransactionId:
+              initialPurchase.revenueCatOriginalTransactionId,
+            purchaseType: "plan",
+            source: "initial_included",
+            purchasedAt: startsAt,
+            expiresAt,
+            price: 0,
+          });
+          syncedExamIds.add(initialExam._id.toString());
+        }
+      }
+    }
+  }
+
+  const activeExamSubscriptions = state.subscriptions.filter((subscription) => {
+    const productId = productIdentifierFromObject(subscription);
+    if (!EXAM_PRODUCT_CODES.has(productId) || isProfessionalProduct(productId)) {
+      return false;
+    }
+    const end = dateFromMillis(
+      subscription?.current_period_ends_at || subscription?.ends_at
+    );
+    return Boolean(subscription?.gives_access && end && end > now);
+  });
+  for (const subscription of activeExamSubscriptions) {
+    if (user.subscriptionTier !== "professional") continue;
+    const productId = productIdentifierFromObject(subscription);
+    const exam = await findExamForProduct(productId);
+    if (!exam) continue;
+    const startsAt =
+      dateFromMillis(subscription?.current_period_starts_at || subscription?.starts_at) || now;
+    const expiresAt =
+      dateFromMillis(subscription?.current_period_ends_at || subscription?.ends_at) ||
+      addExamAccessMonths(startsAt);
+    const subscriptionTransactionId =
+      clean(subscription?.store_purchase_identifier) ||
+      `${clean(subscription?.id) || productId}:${startsAt.toISOString()}`;
+    const access = await unlockExamFromRevenueCat({
+      userId: user._id,
+      exam,
+      productId,
+      transactionId: subscriptionTransactionId,
+      originalTransactionId: clean(subscription?.original_transaction_id),
+      purchasedAt: startsAt,
+      expiresAt,
+    });
+    syncedExamIds.add(exam._id.toString());
+    if (requestedExam && productId === requestedExamProductId) {
+      selectedExam = buildSelectedExamUnlockResponse({ exam, access });
+    }
   }
 
   const usablePurchases = state.purchases.filter(revenueCatPurchaseIsUsable);
@@ -541,13 +711,16 @@ export const syncRevenueCatCustomerAccess = async ({
       unmappedProductIdentifiers.add(productId);
       continue;
     }
+    const legacyPurchasedAt = dateFromMillis(purchase?.purchased_at) || now;
+    const legacyWindow = buildLegacyExamEntitlementWindow(legacyPurchasedAt);
     const access = await unlockExamFromRevenueCat({
       userId: user._id,
       exam,
       productId,
       transactionId: clean(purchase?.store_purchase_identifier || purchase?.id),
-      purchasedAt: dateFromMillis(purchase?.purchased_at) || now,
-      accessDuration: "lifetime",
+      purchasedAt: legacyWindow.startedAt,
+      expiresAt: legacyWindow.expiresAt,
+      source: "legacy",
     });
     syncedExamIds.add(exam._id.toString());
     if (
@@ -560,10 +733,12 @@ export const syncRevenueCatCustomerAccess = async ({
   }
 
   if (requestedExamProductId) {
-    const ownsRequestedProduct = revenueCatPurchasesIncludeProduct(
-      state.purchases,
-      requestedExamProductId
-    );
+    const ownsRequestedProduct =
+      revenueCatPurchasesIncludeProduct(state.purchases, requestedExamProductId) ||
+      activeExamSubscriptions.some(
+        (subscription) =>
+          productIdentifierFromObject(subscription) === requestedExamProductId
+      );
     if (!ownsRequestedProduct || !selectedExam?.unlocked) {
       throw new AppError(
         httpStatus.PAYMENT_REQUIRED,
@@ -700,21 +875,13 @@ const applyExamEvent = async ({ user, event }) => {
   if (!exam) return null;
 
   if (isRevenueCatRefundEvent(event)) {
-    return ExamAccess.findOneAndUpdate(
-      {
-        userId: user._id,
-        examId: exam._id,
-        revenueCatProductId: productId,
-      },
-      {
-        $set: {
-          status: "free",
-          paymentStatus: "refunded",
-          maxQuestionsPerSession: 2,
-        },
-      },
-      { new: true }
-    );
+    return revokeExamEntitlement({
+      userId: user._id,
+      examId: exam._id,
+      externalTransactionId: clean(event.transaction_id),
+      reason: "RevenueCat refund",
+      transactionStatus: "refunded",
+    });
   }
 
   if (!PURCHASE_EVENT_TYPES.has(clean(event.type).toUpperCase())) return null;
@@ -725,6 +892,9 @@ const applyExamEvent = async ({ user, event }) => {
     transactionId: clean(event.transaction_id),
     originalTransactionId: clean(event.original_transaction_id),
     purchasedAt: dateFromMillis(event.purchased_at_ms) || new Date(),
+    expiresAt:
+      dateFromMillis(event.expiration_at_ms) ||
+      addExamAccessMonths(dateFromMillis(event.purchased_at_ms) || new Date()),
     currency: event.currency,
     price: event.price_in_purchased_currency ?? event.price,
   });
@@ -755,14 +925,22 @@ export const processRevenueCatEvent = async ({ event, user }) => {
     applyExamEvent({ user, event }),
   ]);
 
-  if (
-    professionalEvent &&
-    (eventType === "CANCELLATION" || isRevenueCatRefundEvent(event))
-  ) {
-    await downgradeRevenueCatSubscription({
-      user: stateResult.user,
-      subscription: stateResult.state.currentProfessionalSubscription,
-    });
+  if (professionalEvent && isRevenueCatRefundEvent(event)) {
+    const initialPurchase = await ProfessionalPlanPurchase.findOne({
+      userId: user._id,
+      provider: "revenuecat",
+      status: { $in: ["completed", "refunded"] },
+      examId: { $ne: null },
+    }).sort({ purchasedAt: 1 });
+    if (initialPurchase?.examId) {
+      await revokeExamEntitlement({
+        userId: user._id,
+        examId: initialPurchase.examId,
+        externalTransactionId: clean(event.transaction_id),
+        reason: "Initial purchase refunded",
+        transactionStatus: "refunded",
+      });
+    }
   }
 
   return {
@@ -793,11 +971,33 @@ export const recordRevenueCatRefundRequest = async ({
   if (!revenueCatActionSucceeded(status)) {
     return { accepted: false, kind: "none", user };
   }
+  const state = await fetchRevenueCatCustomerState(customerId);
+  if (EXAM_PRODUCT_CODES.has(requestedProductId)) {
+    const ownsExamSubscription = state.subscriptions.some(
+      (subscription) =>
+        productIdentifierFromObject(subscription) === requestedProductId
+    );
+    if (!ownsExamSubscription) {
+      throw new AppError(
+        httpStatus.FORBIDDEN,
+        "RevenueCat does not associate this exam subscription with the signed-in user"
+      );
+    }
+    const exam = await findExamForProduct(requestedProductId);
+    if (exam) {
+      await revokeExamEntitlement({
+        userId: user._id,
+        examId: exam._id,
+        reason: "Customer Center refund request",
+        transactionStatus: "refunded",
+      });
+    }
+    return { accepted: true, kind: "exam_subscription", user, state };
+  }
   if (!isProfessionalProduct(requestedProductId)) {
     return { accepted: false, kind: "non_subscription", user };
   }
 
-  const state = await fetchRevenueCatCustomerState(customerId);
   const ownsSubscription = state.subscriptions.some(
     (subscription) =>
       productIdentifierFromObject(subscription) === requestedProductId
@@ -813,6 +1013,20 @@ export const recordRevenueCatRefundRequest = async ({
     user,
     subscription: state.currentProfessionalSubscription,
   });
+  const initialPurchase = await ProfessionalPlanPurchase.findOne({
+    userId: user._id,
+    provider: "revenuecat",
+    status: "completed",
+    examId: { $ne: null },
+  }).sort({ purchasedAt: 1 });
+  if (initialPurchase?.examId) {
+    await revokeExamEntitlement({
+      userId: user._id,
+      examId: initialPurchase.examId,
+      reason: "Initial purchase refund requested",
+      transactionStatus: "refunded",
+    });
+  }
   return { accepted: true, kind: "subscription", user, state };
 };
 

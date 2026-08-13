@@ -6,8 +6,16 @@ const examAccessSchema = new Schema(
     examId: { type: mongoose.Schema.Types.ObjectId, ref: "Exam", required: true },
     status: {
       type: String,
-      enum: ["free", "unlocked"],
+      // `free`/`unlocked` are retained while older app versions are phased
+      // out. New writes use active/expired/revoked entitlement states.
+      enum: ["free", "unlocked", "active", "expired", "revoked"],
       default: "free",
+    },
+    source: {
+      type: String,
+      enum: ["initial_included", "exam_subscription", "manual", "legacy"],
+      default: "exam_subscription",
+      index: true,
     },
     purchaseType: {
       type: String,
@@ -106,9 +114,10 @@ const examAccessSchema = new Schema(
       default: "pending",
     },
     purchasedAt: { type: Date, default: null },
+    startedAt: { type: Date, default: null },
     accessDuration: {
       type: String,
-      enum: ["three_months", "subscription", "lifetime"],
+      enum: ["three_months", "six_months", "subscription", "lifetime"],
       default: "three_months",
     },
     expiresAt: { type: Date, default: null },
@@ -121,5 +130,6 @@ const examAccessSchema = new Schema(
 );
 
 examAccessSchema.index({ userId: 1, examId: 1 }, { unique: true });
+examAccessSchema.index({ userId: 1, status: 1, expiresAt: 1 });
 
 export const ExamAccess = mongoose.model("ExamAccess", examAccessSchema);
